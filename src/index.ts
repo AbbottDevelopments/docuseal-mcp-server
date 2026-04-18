@@ -1,9 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import axios, { AxiosInstance } from "axios";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -44,7 +46,8 @@ async function docusealPost<T>(path: string, body: unknown): Promise<T> {
 }
 
 // ── MCP Server Factory ────────────────────────────────────────────────────────
-// One server instance per request (stateless pattern — scales cleanly on Railway)
+// One McpServer instance per session (paired 1:1 with a StreamableHTTPServerTransport).
+// The server is created on `initialize` and lives as long as the session.
 
 function createServer(): McpServer {
   const server = new McpServer({
@@ -277,28 +280,62 @@ app.use("/mcp", (req, _res, next) => {
   next();
 });
 
-// MCP endpoint — streamable HTTP, STATELESS mode.
+// MCP endpoint — streamable HTTP, STATEFUL mode.
 //
-// Per the MCP Streamable HTTP spec, in stateless mode the server only supports
-// POST (request/response over a short-lived SSE body). GET (server-initiated
-// notification stream) and DELETE (session termination) are not meaningful
-// without sessions and MUST return 405. The MCP SDK client handles 405 on
-// GET gracefully and falls back to POST-only, which is what Cowork expects.
+// Cowork's plugin MCP client requires a real SSE notification stream tied to
+// a session. Stateless mode (sessionIdGenerator: undefined) is NOT compatible
+// with Cowork — it causes the handshake to hang because GET can't open a
+// session-scoped stream, and returning 405 on GET causes Cowork to retry
+// initialize forever and never call tools/list.
 //
-// DO NOT route GET through transport.handleRequest() — in stateless mode that
-// opens an SSE stream that hangs forever with no events, which blocks the
-// Cowork plugin handshake from completing and causes tools to silently
-// fail to register.
+// Canonical stateful pattern from @modelcontextprotocol/sdk docs:
+//   1. POST initialize → mints a session ID via randomUUID(), returns it in
+//      the Mcp-Session-Id response header, stores transport in `transports` map.
+//   2. Subsequent POSTs with Mcp-Session-Id header route to the same transport.
+//   3. GET with Mcp-Session-Id opens the long-lived SSE notification stream.
+//   4. DELETE with Mcp-Session-Id terminates the session.
+//
+// One transport/server pair per session — lives until the client closes it.
+
+const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+
 app.post("/mcp", requireAuth, async (req, res) => {
   try {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless — fresh server per request
-    });
-    res.on("close", () => {
-      transport.close();
-    });
-    const server = createServer();
-    await server.connect(transport);
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    let transport: StreamableHTTPServerTransport;
+
+    if (sessionId && transports[sessionId]) {
+      // Existing session — reuse its transport.
+      transport = transports[sessionId];
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      // New session — initialize request.
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          console.log(`[mcp] session initialized: ${newSessionId}`);
+          transports[newSessionId] = transport;
+        },
+      });
+
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          console.log(`[mcp] session closed: ${transport.sessionId}`);
+          delete transports[transport.sessionId];
+        }
+      };
+
+      const server = createServer();
+      await server.connect(transport);
+    } else {
+      // Invalid — no session ID and not an initialize request.
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+        id: null,
+      });
+      return;
+    }
+
     await transport.handleRequest(req, res, req.body);
   } catch (err: unknown) {
     console.error("[mcp] POST handler error:", err);
@@ -312,23 +349,19 @@ app.post("/mcp", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/mcp", requireAuth, (_req, res) => {
-  // Stateless: no session → no server-initiated stream possible.
-  res.status(405).json({
-    jsonrpc: "2.0",
-    error: { code: -32000, message: "Method Not Allowed (stateless server — use POST)" },
-    id: null,
-  });
-});
+// Shared handler for GET (SSE notification stream) and DELETE (session terminate).
+async function handleSessionRequest(req: Request, res: Response): Promise<void> {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (!sessionId || !transports[sessionId]) {
+    res.status(400).send("Invalid or missing session ID");
+    return;
+  }
+  const transport = transports[sessionId];
+  await transport.handleRequest(req, res);
+}
 
-app.delete("/mcp", requireAuth, (_req, res) => {
-  // Stateless: nothing to terminate.
-  res.status(405).json({
-    jsonrpc: "2.0",
-    error: { code: -32000, message: "Method Not Allowed (stateless server)" },
-    id: null,
-  });
-});
+app.get("/mcp", requireAuth, handleSessionRequest);
+app.delete("/mcp", requireAuth, handleSessionRequest);
 
 // Start
 app.listen(PORT, () => {

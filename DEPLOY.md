@@ -1,116 +1,129 @@
 # DocuSeal MCP Server — Deploy + Verify Guide
 
-**Fix version:** v0.3.0 (2026-04-18)
-**Root cause patched:** GET `/mcp` now returns 405 in stateless mode instead of hanging an SSE stream forever. This was silently breaking the Cowork plugin handshake.
+**Fix version:** v0.4.0 (2026-04-18) — **STATEFUL MODE**
+**What changed:** The v0.3.0 fix (stateless + 405 on GET) was insufficient. Cowork's MCP client requires a real session-scoped SSE notification stream, and responding with 405 causes Cowork to loop retrying `initialize` forever without ever calling `tools/list`. This version runs the server in canonical MCP **stateful** mode: every `initialize` mints a session ID, returns it in a `Mcp-Session-Id` header, and subsequent GET with that session ID opens a long-lived SSE stream.
 
 ---
 
-## Step 1 — Deploy the updated server to Railway
+## Step 1 — Commit + push (Railway auto-deploys from GitHub)
 
-Railway does **not** auto-deploy from GitHub for this service. You have to push via the Railway CLI from the server directory.
-
-Open PowerShell and run:
+From the repo (via Claude Code in Cursor, or your terminal):
 
 ```powershell
-cd "C:\path\to\Abot Developments\tools\docuseal-mcp-server"
-railway link                    # only if you haven't already — pick the docuseal-mcp-server service
-railway up
+cd "C:\VS Code Projects\Abot Developments"
+git add tools/docuseal-mcp-server/src/index.ts tools/docuseal-mcp-server/DEPLOY.md
+git commit -m "fix(docuseal-mcp): switch to stateful MCP mode for Cowork compatibility"
+git push
 ```
 
-Wait for the build + deploy to finish (Railway will print a green checkmark). The service URL doesn't change — it's still `https://docuseal-mcp-server-production.up.railway.app`.
+Railway will pick up the push and start a new build. Watch the deploy in the Railway dashboard — wait for the green checkmark (~1–2 min).
 
-## Step 2 — Rotate the MCP auth token in Railway
+## Step 2 — Verify the server (stateful handshake preflight)
 
-The v2 token was exposed in a prior chat session. The v3 plugin ships with a **new** token — update Railway to match.
-
-1. Go to the Railway dashboard → `docuseal-mcp-server` service → **Variables**
-2. Find `MCP_AUTH_TOKEN` and set it to:
-   ```
-   3QQ4VvJfsOOMaSPU4LURiq2nyMQNt8bD
-   ```
-3. Railway will auto-redeploy the service with the new variable. Wait ~30 seconds.
-
-## Step 3 — Verify the server works (before touching Cowork)
-
-Run this from PowerShell — a real MCP handshake that mimics what Cowork does. You should see tool definitions come back.
+This preflight captures the `Mcp-Session-Id` from the initialize response and uses it on subsequent calls, exactly like Cowork does.
 
 ```powershell
-# Health check
-curl.exe -sS https://docuseal-mcp-server-production.up.railway.app/health
+$URL   = "https://docuseal-mcp-server-production.up.railway.app"
+$TOKEN = "3QQ4VvJfsOOMaSPU4LURiq2nyMQNt8bD"
 
-# Initialize (should return JSON-RPC initialize response with protocolVersion)
-curl.exe -sS -X POST https://docuseal-mcp-server-production.up.railway.app/mcp `
+# 1. Health (no auth)
+curl.exe -sS "$URL/health"
+
+# 2. Initialize — capture response headers to get Mcp-Session-Id
+curl.exe -sS -i -X POST "$URL/mcp" `
   -H "Content-Type: application/json" `
   -H "Accept: application/json, text/event-stream" `
-  -H "Authorization: Bearer 3QQ4VvJfsOOMaSPU4LURiq2nyMQNt8bD" `
+  -H "Authorization: Bearer $TOKEN" `
   -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"preflight\",\"version\":\"0.1\"}}}'
 
-# tools/list (should return 5 tools: search_templates, load_template, create_template, search_documents, send_documents)
-curl.exe -sS -X POST https://docuseal-mcp-server-production.up.railway.app/mcp `
+# Look for a response header like:   Mcp-Session-Id: 7f3c...uuid...
+# Copy that value into $SID below:
+$SID = "PASTE_SESSION_ID_HERE"
+
+# 3. notifications/initialized (with session ID)
+curl.exe -sS -X POST "$URL/mcp" `
   -H "Content-Type: application/json" `
   -H "Accept: application/json, text/event-stream" `
-  -H "Authorization: Bearer 3QQ4VvJfsOOMaSPU4LURiq2nyMQNt8bD" `
+  -H "Authorization: Bearer $TOKEN" `
+  -H "Mcp-Session-Id: $SID" `
+  -d '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}'
+
+# 4. tools/list (with session ID) — should return 5 tools
+curl.exe -sS -X POST "$URL/mcp" `
+  -H "Content-Type: application/json" `
+  -H "Accept: application/json, text/event-stream" `
+  -H "Authorization: Bearer $TOKEN" `
+  -H "Mcp-Session-Id: $SID" `
   -d '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}'
 
-# GET /mcp — this MUST return 405 now (the fix). If it hangs, the fix didn't deploy.
-curl.exe -sS -i --max-time 5 https://docuseal-mcp-server-production.up.railway.app/mcp `
-  -H "Authorization: Bearer 3QQ4VvJfsOOMaSPU4LURiq2nyMQNt8bD"
+# 5. GET /mcp with session ID — this should HOLD OPEN (SSE stream).
+#    Use --max-time 3 so the command returns; seeing headers then silence = healthy.
+curl.exe -sS -i --max-time 3 "$URL/mcp" `
+  -H "Authorization: Bearer $TOKEN" `
+  -H "Mcp-Session-Id: $SID"
+
+# 6. GET /mcp WITHOUT session ID — must return 400 (invalid session)
+curl.exe -sS -i --max-time 3 "$URL/mcp" `
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 **Pass criteria:**
-- Health returns `{"status":"ok",...}`
-- Initialize returns protocolVersion + capabilities
-- tools/list returns 5 tools
-- **GET returns 405 immediately** (NOT a hang — this is the whole point of the fix)
+- `/health` returns `{"status":"ok",...}`
+- `initialize` response headers include `Mcp-Session-Id: <uuid>`
+- `tools/list` returns 5 tools
+- GET with valid session holds open (returns 200 + SSE content-type, then hangs until timeout — **this is correct**)
+- GET without session returns 400 "Invalid or missing session ID"
 
-## Step 4 — Install the v3 plugin in Cowork
+If initialize succeeds but `tools/list` returns `"Bad Request: No valid session ID provided"`, the session map isn't persisting — check Railway logs for `[mcp] session initialized:` line.
 
-1. Fully quit Cowork (Cmd/Ctrl+Q — not just closing the window)
-2. Go to Settings → Plugins → uninstall `docuseal-mcp-v2` if present
+## Step 3 — Rebuild the plugin (if token changed)
+
+The current plugin is `docuseal-mcp-v3.plugin` at the workspace root. If the token in `Railway.env.MCP_AUTH_TOKEN` still matches what's baked into that plugin's `.mcp.json`, no rebuild needed. Otherwise rebuild:
+
+```powershell
+# Unzip, edit .mcp.json, rezip. Or ask Claude Cowork to rebuild it.
+```
+
+## Step 4 — Install the plugin in Cowork
+
+1. Fully quit Cowork (Ctrl+Q — not just closing the window)
+2. Settings → Plugins → uninstall any old `docuseal-mcp` versions
 3. Reopen Cowork
-4. Drag `docuseal-mcp-v3.plugin` (at the workspace root) into a conversation
+4. Drag `docuseal-mcp-v3.plugin` into a conversation
 5. Click **Install** on the preview card
-6. Fully quit and reopen Cowork again
+6. Fully quit and reopen Cowork
 7. Start a fresh conversation
 
-## Step 5 — Verify tools appear in Cowork
+## Step 5 — Verify tools appear
 
-In the new conversation, say:
+In a new conversation:
 
 > "List the DocuSeal tools you have access to."
 
-You should see the 5 tools: `search_templates`, `load_template`, `create_template`, `search_documents`, `send_documents` (possibly namespaced like `docuseal-mcp:search_templates` or `mcp__plugin_docuseal-mcp_docuseal__search_templates`).
+You should see `search_templates`, `load_template`, `create_template`, `search_documents`, `send_documents`.
 
-If they don't appear:
-
-1. Railway logs will now show `[mcp] POST /mcp rpc=initialize auth=present` for every Cowork handshake attempt. Check the Railway logs — if there are NO entries when Cowork starts, Cowork isn't reaching the server at all (check plugin is actually installed). If there ARE entries but tools don't appear, there's a remaining handshake issue — capture the log lines for the next debug session.
-2. In Cowork Settings → MCP Servers, check if `docuseal` shows connected/green.
-
-## What changed in this fix
-
-**Before (v2 server code):**
-```typescript
-app.all("/mcp", requireAuth, async (req, res) => {
-  // routed BOTH GET and POST through transport.handleRequest()
-  // in stateless mode, GET opens SSE stream that hangs forever
-});
+If they don't appear, Railway logs should now show the full handshake sequence:
+```
+[mcp] POST /mcp rpc=initialize auth=present
+[mcp] session initialized: <uuid>
+[mcp] POST /mcp rpc=notifications/initialized auth=present
+[mcp] GET /mcp auth=present          ← SSE stream (no 405!)
+[mcp] POST /mcp rpc=tools/list auth=present   ← THIS line was missing before
 ```
 
-**After (v3 server code):**
-```typescript
-app.post("/mcp", requireAuth, async (req, res) => {
-  // POST → process JSON-RPC through transport
-});
-app.get("/mcp", requireAuth, (_req, res) => {
-  res.status(405).json(...);  // MCP SDK client handles 405 gracefully
-});
-app.delete("/mcp", requireAuth, (_req, res) => {
-  res.status(405).json(...);
-});
-// + request logging middleware for diagnostics
-```
+If `tools/list` never appears in logs, the GET isn't establishing the SSE stream — check that the GET response has content-type `text/event-stream` and hangs open (isn't immediately 400/405).
 
-## Next step after this works — DocuSeal side
+## Why stateful, not stateless
+
+The MCP Streamable HTTP spec allows both. Stateless is simpler (one server per POST, no session tracking) and works with Claude Code and `mcp-remote`. **Cowork's plugin MCP client does not.** Cowork:
+
+1. POSTs `initialize` — expects `Mcp-Session-Id` in response headers
+2. Opens a GET `/mcp` with that session ID to receive server→client notifications
+3. Only advances to `tools/list` **after the SSE stream is open**
+
+In stateless mode there is no session ID to return, and the GET either hangs forever (if routed through the transport) or returns 405 (per spec). Cowork interprets both as "the server is still initializing" and never progresses. Stateful mode is the only compatible path for Cowork plugin MCPs.
+
+## Next step after tools work — DocuSeal email sending
 
 Once tools appear in Cowork, there are two remaining blockers for actually sending signing emails:
 
