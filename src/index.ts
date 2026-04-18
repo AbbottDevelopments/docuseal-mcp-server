@@ -262,24 +262,72 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "docuseal-mcp-server", base_url: DOCUSEAL_BASE_URL });
 });
 
-// MCP endpoint — handle POST (requests) and GET (SSE stream) through the transport
-// DELETE is handled for session termination (stateless: always 200)
-app.all("/mcp", requireAuth, async (req, res) => {
-  if (req.method === "DELETE") {
-    res.status(200).json({ message: "Session terminated" });
-    return;
-  }
-  if (req.method !== "GET" && req.method !== "POST") {
-    res.status(405).json({ error: `Method ${req.method} not allowed` });
-    return;
-  }
+// Request logger for diagnostics — logs method, path, and any JSON-RPC method
+// in the body so we can see exactly what Cowork is sending during startup.
+app.use("/mcp", (req, _res, next) => {
+  const rpcMethod =
+    req.method === "POST" && req.body && typeof req.body === "object"
+      ? (req.body as { method?: string }).method
+      : undefined;
+  console.log(
+    `[mcp] ${req.method} ${req.path}` +
+      (rpcMethod ? ` rpc=${rpcMethod}` : "") +
+      ` auth=${req.headers.authorization ? "present" : "missing"}`
+  );
+  next();
+});
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless — no session tracking needed
+// MCP endpoint — streamable HTTP, STATELESS mode.
+//
+// Per the MCP Streamable HTTP spec, in stateless mode the server only supports
+// POST (request/response over a short-lived SSE body). GET (server-initiated
+// notification stream) and DELETE (session termination) are not meaningful
+// without sessions and MUST return 405. The MCP SDK client handles 405 on
+// GET gracefully and falls back to POST-only, which is what Cowork expects.
+//
+// DO NOT route GET through transport.handleRequest() — in stateless mode that
+// opens an SSE stream that hangs forever with no events, which blocks the
+// Cowork plugin handshake from completing and causes tools to silently
+// fail to register.
+app.post("/mcp", requireAuth, async (req, res) => {
+  try {
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless — fresh server per request
+    });
+    res.on("close", () => {
+      transport.close();
+    });
+    const server = createServer();
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err: unknown) {
+    console.error("[mcp] POST handler error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
+  }
+});
+
+app.get("/mcp", requireAuth, (_req, res) => {
+  // Stateless: no session → no server-initiated stream possible.
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method Not Allowed (stateless server — use POST)" },
+    id: null,
   });
-  const server = createServer();
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+});
+
+app.delete("/mcp", requireAuth, (_req, res) => {
+  // Stateless: nothing to terminate.
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method Not Allowed (stateless server)" },
+    id: null,
+  });
 });
 
 // Start
