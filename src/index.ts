@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
+import cors from "cors";
 import axios, { AxiosInstance } from "axios";
 import { z } from "zod";
 
@@ -234,10 +235,19 @@ Examples:
 // ── Express App ───────────────────────────────────────────────────────────────
 
 const app = express();
+
+// CORS — required for Cowork/Electron to reach the server
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "Mcp-Session-Id"],
+  exposedHeaders: ["Mcp-Session-Id"],
+}));
+
 app.use(express.json());
 
 // Auth middleware
-function requireAuth(req: Request, res: Response, next: () => void): void {
+function requireAuth(req: Request, res: Response, next: NextFunction): void {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.replace(/^Bearer\s+/i, "").trim();
   if (!token || token !== MCP_AUTH_TOKEN) {
@@ -252,18 +262,24 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "docuseal-mcp-server", base_url: DOCUSEAL_BASE_URL });
 });
 
-// MCP endpoint
-app.post("/mcp", requireAuth, async (req, res) => {
+// MCP endpoint — handle POST (requests) and GET (SSE stream) through the transport
+// DELETE is handled for session termination (stateless: always 200)
+app.all("/mcp", requireAuth, async (req, res) => {
+  if (req.method === "DELETE") {
+    res.status(200).json({ message: "Session terminated" });
+    return;
+  }
+  if (req.method !== "GET" && req.method !== "POST") {
+    res.status(405).json({ error: `Method ${req.method} not allowed` });
+    return;
+  }
+
   const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless
+    sessionIdGenerator: undefined, // stateless — no session tracking needed
   });
   const server = createServer();
   await server.connect(transport);
   await transport.handleRequest(req, res, req.body);
-});
-
-app.get("/mcp", (_req, res) => {
-  res.status(405).json({ error: "MCP endpoint requires POST" });
 });
 
 // Start
