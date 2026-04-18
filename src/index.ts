@@ -265,6 +265,24 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "docuseal-mcp-server", base_url: DOCUSEAL_BASE_URL });
 });
 
+// Debug: list active sessions (auth-gated). Useful for confirming whether
+// Cowork's session is actually alive at any given moment.
+app.get("/debug/sessions", requireAuth, (_req, res) => {
+  const sessions = Object.keys(transports).map((sid) => {
+    const t = transports[sid];
+    return {
+      sessionId: sid,
+      sessionIdShort: sid.slice(0, 8),
+      transportSessionId: t.sessionId,
+      transportMatches: t.sessionId === sid,
+    };
+  });
+  res.json({
+    activeSessionCount: sessions.length,
+    sessions,
+  });
+});
+
 // Request logger for diagnostics — logs method, path, and any JSON-RPC method
 // in the body so we can see exactly what Cowork is sending during startup.
 app.use("/mcp", (req, res, next) => {
