@@ -267,16 +267,37 @@ app.get("/health", (_req, res) => {
 
 // Request logger for diagnostics — logs method, path, and any JSON-RPC method
 // in the body so we can see exactly what Cowork is sending during startup.
-app.use("/mcp", (req, _res, next) => {
+app.use("/mcp", (req, res, next) => {
   const rpcMethod =
     req.method === "POST" && req.body && typeof req.body === "object"
       ? (req.body as { method?: string }).method
       : undefined;
+  const sid = (req.headers["mcp-session-id"] as string | undefined) || "(none)";
+  const accept = (req.headers["accept"] as string | undefined) || "(none)";
+  const pv = (req.headers["mcp-protocol-version"] as string | undefined) || "(none)";
   console.log(
     `[mcp] ${req.method} ${req.path}` +
       (rpcMethod ? ` rpc=${rpcMethod}` : "") +
+      ` sid=${sid.slice(0, 8)}` +
+      ` accept="${accept}"` +
+      ` pv=${pv}` +
       ` auth=${req.headers.authorization ? "present" : "missing"}`
   );
+  // Log response status + headers after handler finishes
+  res.on("finish", () => {
+    const ct = res.getHeader("content-type") || "(none)";
+    const respSid = res.getHeader("mcp-session-id") || "(none)";
+    console.log(
+      `[mcp] -> ${req.method} ${req.path} status=${res.statusCode}` +
+        ` content-type="${ct}"` +
+        ` resp-sid=${typeof respSid === "string" ? respSid.slice(0, 8) : respSid}`
+    );
+  });
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      console.log(`[mcp] -> ${req.method} ${req.path} CLOSED before end (status=${res.statusCode})`);
+    }
+  });
   next();
 });
 
@@ -322,6 +343,10 @@ app.post("/mcp", requireAuth, async (req, res) => {
           console.log(`[mcp] session closed: ${transport.sessionId}`);
           delete transports[transport.sessionId];
         }
+      };
+
+      transport.onerror = (err) => {
+        console.error(`[mcp] transport error (sid=${transport.sessionId?.slice(0, 8)}):`, err);
       };
 
       const server = createServer();
