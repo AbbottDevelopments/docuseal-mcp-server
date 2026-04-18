@@ -348,8 +348,13 @@ app.post("/mcp", requireAuth, async (req, res) => {
       transport = transports[sessionId];
     } else if (!sessionId && isInitializeRequest(req.body)) {
       // New session — initialize request.
+      // enableJsonResponse=true makes POST responses return as plain
+      // application/json instead of SSE-framed. The GET SSE stream still
+      // works normally. Some MCP clients (notably Cowork's) appear to not
+      // progress past initialize when the response is SSE-framed.
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: true,
         onsessioninitialized: (newSessionId) => {
           console.log(`[mcp] session initialized: ${newSessionId}`);
           transports[newSessionId] = transport;
