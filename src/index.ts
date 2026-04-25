@@ -50,10 +50,13 @@ async function docusealPost<T>(path: string, body: unknown): Promise<T> {
 // The server is created on `initialize` and lives as long as the session.
 
 function createServer(): McpServer {
-  const server = new McpServer({
-    name: "docuseal-mcp-server",
-    version: "1.0.0",
-  });
+  const server = new McpServer(
+    { name: "DocuSeal", version: "1.0.0" },
+    {
+      instructions:
+        "DocuSeal e-signature MCP. Use this to manage document templates and send signing requests. Tools: search_templates, load_template, create_template, search_documents, send_documents.",
+    }
+  );
 
   // ── Tool: search_templates ──────────────────────────────────────────────────
 
