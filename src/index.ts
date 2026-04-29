@@ -26,7 +26,7 @@ if (!MCP_AUTH_TOKEN) {
 // ── DocuSeal API Client ───────────────────────────────────────────────────────
 
 const api: AxiosInstance = axios.create({
-  baseURL: `${DOCUSEAL_BASE_URL}/api/v1`,
+  baseURL: `${DOCUSEAL_BASE_URL}/api`,
   headers: {
     "X-Auth-Token": DOCUSEAL_API_KEY,
     "Content-Type": "application/json",
